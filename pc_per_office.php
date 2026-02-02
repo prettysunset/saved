@@ -714,8 +714,8 @@ if ($office_id) {
                 </div>
 
                 <div style="position:relative;margin-top:10px">
-                    <video id="video" autoplay playsinline style="width:100%;border-radius:8px;background:#000;display:block"></video>
-                    <canvas id="canvas" style="position:absolute;left:0;top:0;width:100%;height:100%;border-radius:8px;pointer-events:none;display:block"></canvas>
+                    <video id="video" autoplay playsinline style="width:100%;border-radius:8px;background:#000;display:block;transform:scaleX(-1);"></video>
+                    <canvas id="canvas" style="position:absolute;left:0;top:0;width:100%;height:100%;border-radius:8px;pointer-events:none;display:block;transform:scaleX(-1);"></canvas>
                     <div id="blinkPrompt" style="position:absolute;left:50%;top:8%;transform:translateX(-50%);background:rgba(0,0,0,0.6);color:#fff;padding:8px 12px;border-radius:8px;font-weight:700;display:none;z-index:9999">Blink when prompted</div>
                 </div>
 
@@ -841,127 +841,133 @@ if ($office_id) {
 
     console.log('faceapi typeof ->', typeof faceapi);
     async function loadModels(){
-        try{
-            await faceapi.nets.tinyFaceDetector.load('models/');
-            await faceapi.nets.faceLandmark68Net.load('models/');
-            await faceapi.nets.faceRecognitionNet.load('models/');
+        // try local models first, then fallback to CDN if not present
+        const local = 'models/';
+        const cdn = 'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@master/weights/';
+        try {
+            await faceapi.nets.tinyFaceDetector.loadFromUri(local);
+            await faceapi.nets.faceLandmark68Net.loadFromUri(local);
+            await faceapi.nets.faceRecognitionNet.loadFromUri(local);
+            console.info('Loaded face-api models from', local);
             return true;
-        }catch(e){ showMsg('Model load failed: '+e.message, false); return false; }
+        } catch (errLocal) {
+            console.warn('Local models not available:', errLocal && errLocal.message ? errLocal.message : errLocal);
+            try {
+                await faceapi.nets.tinyFaceDetector.loadFromUri(cdn);
+                await faceapi.nets.faceLandmark68Net.loadFromUri(cdn);
+                await faceapi.nets.faceRecognitionNet.loadFromUri(cdn);
+                console.info('Loaded face-api models from CDN', cdn);
+                return true;
+            } catch (errCdn) {
+                console.error('Failed to load models from CDN:', errCdn && errCdn.message ? errCdn.message : errCdn);
+                showMsg('Model load failed: '+ (errCdn && errCdn.message ? errCdn.message : String(errCdn)), false);
+                return false;
+            }
+        }
     }
 
-    async function performScan(){
-        scanBtn.disabled = true;
-        try{
-            if (!videoEl.srcObject) { showMsg('Start camera first', false); return; }
-            const ctx = canvasEl.getContext('2d');
-            // pre-countdown so user knows when to blink
-            const promptEl = document.getElementById('blinkPrompt');
-            const beep = () => {
-                try {
-                    const actx = new (window.AudioContext || window.webkitAudioContext)();
-                    const o = actx.createOscillator();
-                    const g = actx.createGain();
-                    o.connect(g); g.connect(actx.destination);
-                    o.frequency.value = 1000; g.gain.value = 0.05; o.start();
-                    setTimeout(()=>{ try{ o.stop(); actx.close(); }catch(e){} }, 150);
-                } catch(e) { /* ignore audio errors */ }
-            };
-            if (promptEl) { promptEl.style.display = 'block'; promptEl.textContent = 'Get ready...'; }
-            // countdown 3..1
-            for (let i=3;i>=1;i--) {
-                if (promptEl) promptEl.textContent = 'Get ready: ' + i;
-                await new Promise(r=>setTimeout(r, 750));
-            }
-            if (promptEl) { promptEl.textContent = 'Blink now!'; }
-            beep();
-            // liveness via blink detection: monitor frames for a short window and detect a blink
-            const START = Date.now();
-            const WINDOW_MS = 4000; // ms to wait for a blink after prompt
-            const FRAME_DELAY = 250;
-            const EAR_THRESHOLD = 0.22;
-            const MIN_CONSEC_BELOW = 2;
-            let consecBelow = 0;
-            let blinkDetected = false;
-            let lastDetection = null;
-            while (Date.now() - START < WINDOW_MS && !blinkDetected) {
-                // size canvas
-                canvasEl.width = videoEl.videoWidth || videoEl.clientWidth || 640;
-                canvasEl.height = videoEl.videoHeight || Math.round(canvasEl.width * (3/4)) || 480;
-                ctx.clearRect(0,0,canvasEl.width,canvasEl.height);
-                ctx.drawImage(videoEl,0,0,canvasEl.width,canvasEl.height);
-                const det = await faceapi.detectSingleFace(canvasEl, new faceapi.TinyFaceDetectorOptions()).withFaceLandmarks().withFaceDescriptor();
-                if (det && det.descriptor) lastDetection = det;
-                if (det && det.landmarks) {
-                    const pts = det.landmarks.positions;
-                    const dist = (a,b) => Math.hypot(a.x-b.x, a.y-b.y);
-                    const l = pts.slice(36,42);
-                    const r = pts.slice(42,48);
-                    const ear = ( (dist(l[1],l[5]) + dist(l[2],l[4])) / (2*dist(l[0],l[3])) + (dist(r[1],r[5]) + dist(r[2],r[4])) / (2*dist(r[0],r[3])) ) / 2;
-                    // indicator in prompt
-                    if (promptEl) promptEl.textContent = 'Blink now! (EAR ' + ear.toFixed(3) + ')';
-                    if (ear < EAR_THRESHOLD) {
-                        consecBelow++;
-                    } else {
-                        if (consecBelow >= MIN_CONSEC_BELOW) { blinkDetected = true; break; }
-                        consecBelow = 0;
+    // low-latency live scanning using requestAnimationFrame and a small offscreen canvas
+    let rafId = null;
+    let lastSentHash = null;
+    let lastSentAt = 0;
+    const SEND_DEBOUNCE_MS = 4000; // ms
+
+    async function startLiveScan() {
+        if (!videoEl.srcObject) return;
+        if (rafId) return; // already running
+
+        const mainCtx = canvasEl.getContext('2d');
+        const MODEL_SIZE = 128; // small input for tiny detector
+        const tinyOpts = new faceapi.TinyFaceDetectorOptions({ inputSize: MODEL_SIZE, scoreThreshold: 0.5 });
+
+        // offscreen canvas for fast, small detections
+        const smallCanvas = document.createElement('canvas');
+        smallCanvas.width = MODEL_SIZE; smallCanvas.height = MODEL_SIZE;
+        const smallCtx = smallCanvas.getContext('2d');
+
+        let frameCount = 0;
+        const FRAME_SKIP = 2; // process every Nth frame
+        let stableCount = 0;
+        const STABLE_REQUIRED = 3;
+
+        async function loop() {
+            rafId = requestAnimationFrame(loop);
+            frameCount++;
+
+            const w = videoEl.videoWidth || videoEl.clientWidth || 640;
+            const h = videoEl.videoHeight || Math.round(w * (3/4)) || 480;
+            canvasEl.width = w; canvasEl.height = h;
+            mainCtx.clearRect(0,0,canvasEl.width,canvasEl.height);
+            mainCtx.drawImage(videoEl,0,0,canvasEl.width,canvasEl.height);
+
+            // draw to small canvas maintaining aspect ratio
+            const sx = videoEl.videoWidth || videoEl.clientWidth || 640;
+            const sy = videoEl.videoHeight || videoEl.clientHeight || 480;
+            // fit video into MODEL_SIZE box
+            smallCtx.drawImage(videoEl, 0, 0, smallCanvas.width, smallCanvas.height);
+
+            if ((frameCount % FRAME_SKIP) !== 0) return;
+
+            try {
+                const detection = await faceapi.detectSingleFace(smallCanvas, tinyOpts).withFaceLandmarks();
+                if (detection && detection.detection) {
+                    stableCount++;
+                } else {
+                    stableCount = 0;
+                }
+
+                // draw overlay scaled from smallCanvas to main canvas
+                if (detection && detection.detection) {
+                    const box = detection.detection.box;
+                    const scaleX = canvasEl.width / smallCanvas.width;
+                    const scaleY = canvasEl.height / smallCanvas.height;
+                    mainCtx.strokeStyle = '#00FF00'; mainCtx.lineWidth = 2; mainCtx.globalAlpha = 0.95;
+                    mainCtx.strokeRect(box.x * scaleX, box.y * scaleY, box.width * scaleX, box.height * scaleY);
+                    if (detection.landmarks) {
+                        mainCtx.fillStyle = '#00FF00';
+                        for (const p of detection.landmarks.positions) mainCtx.fillRect(p.x * scaleX -1, p.y * scaleY -1, 2, 2);
                     }
                 }
-                await new Promise(r=>setTimeout(r, FRAME_DELAY));
-            }
-            if (promptEl) promptEl.style.display = 'none';
-            if (!lastDetection || !lastDetection.descriptor) { showMsg('No face detected', false); return; }
-            if (!blinkDetected) { showMsg('Liveness not confirmed (no blink detected)', false); return; }
 
-            // draw final overlay and prepare descriptor
-            try{
-                const box = lastDetection.detection.box;
-                ctx.strokeStyle = '#00FF00'; ctx.lineWidth = 3; ctx.globalAlpha = 0.9;
-                ctx.strokeRect(box.x, box.y, box.width, box.height);
-                if (lastDetection.landmarks) {
-                    ctx.fillStyle = '#00FF00';
-                    const pts = lastDetection.landmarks.positions || [];
-                    for (let p of pts) { ctx.fillRect(p.x-2, p.y-2, 4, 4); }
+                if (stableCount >= STABLE_REQUIRED) {
+                    // get descriptor once when face is stable
+                    const detWithDesc = await faceapi.detectSingleFace(smallCanvas, tinyOpts).withFaceLandmarks().withFaceDescriptor();
+                    if (detWithDesc && detWithDesc.descriptor) {
+                        const desc = Array.from(detWithDesc.descriptor || []);
+                        const hash = desc.slice(0,16).map(x => Math.round(x*1000)).join(',');
+                        const now = Date.now();
+                        if (hash !== lastSentHash || (now - lastSentAt) > SEND_DEBOUNCE_MS) {
+                            lastSentHash = hash; lastSentAt = now;
+                            const fd = new FormData(); fd.append('action','face_scan'); fd.append('descriptor', JSON.stringify(desc));
+                            const dNow = new Date(); fd.append('client_ts', dNow.toISOString());
+                            const localDate = dNow.getFullYear() + '-' + String(dNow.getMonth()+1).padStart(2,'0') + '-' + String(dNow.getDate()).padStart(2,'0');
+                            const localTime = String(dNow.getHours()).padStart(2,'0') + ':' + String(dNow.getMinutes()).padStart(2,'0') + ':' + String(dNow.getSeconds()).padStart(2,'0');
+                            fd.append('client_local_date', localDate); fd.append('client_local_time', localTime);
+                            fetch(window.location.href, { method:'POST', body: fd })
+                                .then(r => r.json().catch(()=>null))
+                                .then(j => {
+                                    if (!j) { showMsg('Server returned invalid JSON', false); return; }
+                                    if (j.success) {
+                                        const who = j.display_name || j.username || '';
+                                        const dist = (j.distance !== undefined) ? j.distance : j.best_distance;
+                                        const distText = (dist !== undefined) ? (' dist=' + Number(dist).toFixed(3)) : '';
+                                        showMsg((j.message || 'Timed in') + (who ? ' — ' + who : '') + distText, true);
+                                    } else {
+                                        let msgText = j.message || 'No match';
+                                        if (j.best_distance !== undefined) msgText += ' (best_distance: ' + Number(j.best_distance).toFixed(3) + ')';
+                                        showMsg(msgText, false);
+                                    }
+                                }).catch(()=>{ showMsg('Network error during scan', false); });
+                        }
+                    }
+                    stableCount = 0; // reset to avoid repeated descriptor calls
                 }
-            }catch(e){ console.warn('draw overlay failed', e); }
-
-            const desc = Array.from(lastDetection.descriptor);
-            const fd = new FormData(); fd.append('action','face_scan'); fd.append('descriptor', JSON.stringify(desc));
-            const dNow = new Date();
-            fd.append('client_ts', dNow.toISOString());
-            const localDate = dNow.getFullYear() + '-' + String(dNow.getMonth()+1).padStart(2,'0') + '-' + String(dNow.getDate()).padStart(2,'0');
-            const localTime = String(dNow.getHours()).padStart(2,'0') + ':' + String(dNow.getMinutes()).padStart(2,'0') + ':' + String(dNow.getSeconds()).padStart(2,'0');
-            fd.append('client_local_date', localDate); fd.append('client_local_time', localTime);
-            const res = await fetch(window.location.href, { method:'POST', body: fd });
-            if (!res.ok) {
-                const txt = await res.text().catch(()=> '');
-                showMsg('Server error: ' + res.status + ' ' + res.statusText + (txt ? ' — ' + txt.slice(0,200) : ''), false);
-                return;
+            } catch (e) {
+                console.warn('live scan loop error', e);
             }
-            let j = null;
-            try { j = await res.json(); } catch(parseErr) {
-                const txt = await res.text().catch(()=> '');
-                showMsg('Invalid JSON response' + (txt ? ': '+txt.slice(0,200) : ''), false);
-                return;
-            }
-            console.log('face_scan response:', j);
-            if (j.success) {
-                const who = j.display_name || j.username || (j.user_id ? ('user id ' + j.user_id) : '');
-                const dist = (j.distance !== undefined) ? j.distance : j.best_distance;
-                const distText = (dist !== undefined) ? (' dist=' + Number(dist).toFixed(3)) : '';
-                showMsg((j.message || 'Timed in') + (who ? ' — ' + who : '') + distText, true);
-            } else {
-                let msgText = j.message || 'No match';
-                if (j.best_distance !== undefined) msgText += ' (best_distance: ' + Number(j.best_distance).toFixed(3) + ')';
-                if (j.templates_scanned !== undefined) msgText += ' scanned=' + j.templates_scanned;
-                showMsg(msgText, false);
-                console.debug('face_scan debug:', j);
-            }
-        } catch (err) {
-            console.error('scan error', err);
-            showMsg('Error during scan: ' + (err && err.message ? err.message : String(err)), false);
-        } finally {
-            scanBtn.disabled = false;
         }
+
+        loop();
     }
 
     startCamBtn && startCamBtn.addEventListener('click', async (e)=>{
@@ -974,10 +980,30 @@ if ($office_id) {
             videoEl.srcObject = camStream;
             showMsg('Camera started.', true);
             scanBtn.disabled = false;
+            // start continuous live scanning
+            startLiveScan();
         }catch(e){ showMsg('Cannot access camera: '+e.message, false); startCamBtn.disabled = false; }
     });
 
-    scanBtn && scanBtn.addEventListener('click', performScan);
+    scanBtn && scanBtn.addEventListener('click', startLiveScan);
+
+    // attempt to auto-start camera and live scan on page load (will prompt for permission)
+    (async function autoStart(){
+        try {
+            // try to load models first
+            const ok = await loadModels();
+            if (!ok) return;
+            // request camera
+            camStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
+            videoEl.srcObject = camStream;
+            showMsg('Camera started (auto).', true);
+            scanBtn.disabled = false;
+            startLiveScan();
+        } catch (e) {
+            // ignore auto-start errors (user denied or blocked)
+            console.info('Auto-start camera failed:', e && e.message ? e.message : e);
+        }
+    })();
 
     // global error handlers to help debugging in the UI
     window.addEventListener('error', function(e){
